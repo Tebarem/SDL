@@ -24,10 +24,26 @@
 #include "SDL_keyboard_c.h"
 #include "../stdlib/SDL_sysstdlib.h"
 
+/* The keys are unique 32-bit values, but they can't be used as the hash
+ * directly. The table only looks at the low bits to pick a bucket, and the
+ * modifiers live in the high 16 bits, so every modifier combination of a
+ * scancode would land in the same bucket and the table would degrade into
+ * long linear scans. Mix the bits first (this is the MurmurHash3 finalizer).
+ */
+static SDL_INLINE Uint32 SDL_HashKeymapKey(Uint32 key)
+{
+    key ^= key >> 16;
+    key *= 0x85ebca6b;
+    key ^= key >> 13;
+    key *= 0xc2b2ae35;
+    key ^= key >> 16;
+    return key;
+}
+
 #define SDL_HASHTABLE_NAME                     SDL_KeycodeMap
 #define SDL_HASHTABLE_KEY                      Uint32 // Keycode or scancode + modifiers
 #define SDL_HASHTABLE_VALUE                    Uint32 // Keycode or scancode + modifiers
-#define SDL_HASHTABLE_HASH_KEY(unused, key)    (key)  // It's already a unique 32-bit value.
+#define SDL_HASHTABLE_HASH_KEY(unused, key)    SDL_HashKeymapKey(key)
 #define SDL_HASHTABLE_KEYS_EQUAL(unused, a, b) (a == b)
 #include "../SDL_generic_hashtable.h"
 
