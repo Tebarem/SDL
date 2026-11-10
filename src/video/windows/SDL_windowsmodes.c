@@ -120,17 +120,17 @@ static void *WIN_GetDXGIOutput(SDL_VideoDevice *_this, const WCHAR *DeviceName)
     void *result = NULL;
 
 #ifdef HAVE_DXGI_H
-    const SDL_VideoData *videodata = (const SDL_VideoData *)_this->internal;
+    IDXGIFactory *pDXGIFactory = WIN_GetDXGIFactory(_this);
     int nAdapter, nOutput;
     IDXGIAdapter *pDXGIAdapter;
     IDXGIOutput *pDXGIOutput;
 
-    if (!videodata->pDXGIFactory) {
+    if (!pDXGIFactory) {
         return NULL;
     }
 
     nAdapter = 0;
-    while (!result && SUCCEEDED(IDXGIFactory_EnumAdapters(videodata->pDXGIFactory, nAdapter, &pDXGIAdapter))) {
+    while (!result && SUCCEEDED(IDXGIFactory_EnumAdapters(pDXGIFactory, nAdapter, &pDXGIAdapter))) {
         nOutput = 0;
         while (!result && SUCCEEDED(IDXGIAdapter_EnumOutputs(pDXGIAdapter, nOutput, &pDXGIOutput))) {
             DXGI_OUTPUT_DESC outputDesc;
@@ -249,6 +249,39 @@ static void WIN_GetRefreshRate(void *dxgi_output, DEVMODEW *mode, int *numerator
 #endif // HAVE_DXGI_H
 }
 
+static bool WIN_GetMonitorPathInfo(SDL_VideoData *videodata, HMONITOR hMonitor, DISPLAYCONFIG_PATH_INFO *path_info);
+
+/* Get the refresh rate of the mode a monitor is currently using without
+ * going through DXGI, which is slow to start up. Returns false if the
+ * rate isn't available or doesn't agree with the mode we were given.
+ */
+static bool WIN_GetActiveRefreshRate(SDL_VideoDevice *_this, HMONITOR hMonitor, const DEVMODEW *mode, int *numerator, int *denominator)
+{
+    DISPLAYCONFIG_PATH_INFO path_info;
+    const DISPLAYCONFIG_RATIONAL *rate = &path_info.targetInfo.refreshRate;
+
+    if (!hMonitor || !WIN_GetMonitorPathInfo(_this->internal, hMonitor, &path_info)) {
+        return false;
+    }
+
+    if (rate->Numerator == 0 || rate->Denominator == 0 ||
+        rate->Numerator > SDL_MAX_SINT32 || rate->Denominator > SDL_MAX_SINT32) {
+        return false;
+    }
+
+    // dmDisplayFrequency is the rate rounded down, or 0 or 1 for the hardware default
+    if (mode->dmDisplayFrequency > 1) {
+        const double hz = (double)rate->Numerator / rate->Denominator;
+        if (hz < (double)mode->dmDisplayFrequency - 0.5 || hz > (double)mode->dmDisplayFrequency + 1.0) {
+            return false;
+        }
+    }
+
+    *numerator = (int)rate->Numerator;
+    *denominator = (int)rate->Denominator;
+    return true;
+}
+
 static float WIN_GetContentScale(SDL_VideoDevice *_this, HMONITOR hMonitor)
 {
     int dpi = 0;
@@ -298,7 +331,21 @@ static bool WIN_GetDisplayMode(SDL_VideoDevice *_this, void *dxgi_output, HMONIT
     mode->format = SDL_PIXELFORMAT_UNKNOWN;
     mode->w = data->DeviceMode.dmPelsWidth;
     mode->h = data->DeviceMode.dmPelsHeight;
-    WIN_GetRefreshRate(dxgi_output, &data->DeviceMode, &mode->refresh_rate_numerator, &mode->refresh_rate_denominator);
+    if (index == ENUM_CURRENT_SETTINGS) {
+        /* The current mode is queried at startup and whenever the displays
+         * change, so avoid DXGI for it when we can. Always try this first so
+         * the current mode gets the same refresh rate wherever it's reported.
+         */
+        if (!WIN_GetActiveRefreshRate(_this, hMonitor, &data->DeviceMode, &mode->refresh_rate_numerator, &mode->refresh_rate_denominator)) {
+            void *current_output = dxgi_output ? dxgi_output : WIN_GetDXGIOutput(_this, deviceName);
+            WIN_GetRefreshRate(current_output, &data->DeviceMode, &mode->refresh_rate_numerator, &mode->refresh_rate_denominator);
+            if (current_output != dxgi_output) {
+                WIN_ReleaseDXGIOutput(current_output);
+            }
+        }
+    } else {
+        WIN_GetRefreshRate(dxgi_output, &data->DeviceMode, &mode->refresh_rate_numerator, &mode->refresh_rate_denominator);
+    }
 
     // Fill in the mode information
     WIN_UpdateDisplayMode(_this, deviceName, index, mode);
@@ -439,6 +486,7 @@ static bool WIN_GetMonitorDESC1(HMONITOR hMonitor, DXGI_OUTPUT_DESC1 *desc)
     }
     return found;
 }
+#endif // HAVE_DXGI1_6_H
 
 static bool WIN_GetMonitorPathInfo(SDL_VideoData *videodata, HMONITOR hMonitor, DISPLAYCONFIG_PATH_INFO *path_info)
 {
@@ -510,6 +558,41 @@ done:
     return found;
 }
 
+#ifdef HAVE_DXGI1_6_H
+/* Returns false only if we know for sure that the monitor isn't in an
+ * advanced color (HDR or wide gamut) mode. That can be answered without
+ * DXGI, which is slow to start up.
+ */
+static bool WIN_MonitorMayBeHDR(SDL_VideoDevice *_this, HMONITOR hMonitor)
+{
+    DISPLAYCONFIG_PATH_INFO path_info;
+    SDL_VideoData *videodata = _this->internal;
+
+    if (WIN_GetMonitorPathInfo(videodata, hMonitor, &path_info)) {
+        // Declared here for the same reason as SDL_DISPLAYCONFIG_SDR_WHITE_LEVEL below
+        struct SDL_DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
+          DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+          UINT32 value;
+          UINT32 colorEncoding;
+          UINT32 bitsPerColorChannel;
+        } color_info;
+        #define SDL_DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO 9
+        #define SDL_DISPLAYCONFIG_ADVANCED_COLOR_ENABLED 0x2
+
+        SDL_zero(color_info);
+        color_info.header.type = SDL_DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        color_info.header.size = sizeof(color_info);
+        color_info.header.adapterId = path_info.targetInfo.adapterId;
+        color_info.header.id = path_info.targetInfo.id;
+        // WIN_GetMonitorPathInfo() succeeded: DisplayConfigGetDeviceInfo is not NULL
+        if (videodata->DisplayConfigGetDeviceInfo(&color_info.header) == ERROR_SUCCESS &&
+            !(color_info.value & SDL_DISPLAYCONFIG_ADVANCED_COLOR_ENABLED)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static float WIN_GetSDRWhitePoint(SDL_VideoDevice *_this, HMONITOR hMonitor)
 {
     DISPLAYCONFIG_PATH_INFO path_info;
@@ -544,6 +627,10 @@ static void WIN_GetHDRProperties(SDL_VideoDevice *_this, HMONITOR hMonitor, SDL_
 
     SDL_zerop(HDR);
 
+    if (!WIN_MonitorMayBeHDR(_this, hMonitor)) {
+        return;
+    }
+
     if (WIN_GetMonitorDESC1(hMonitor, &desc)) {
         if (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
             HDR->SDR_white_level = WIN_GetSDRWhitePoint(_this, hMonitor);
@@ -558,7 +645,6 @@ static void WIN_AddDisplay(SDL_VideoDevice *_this, HMONITOR hMonitor, const MONI
     int i, index = *display_index;
     SDL_VideoDisplay display;
     SDL_DisplayData *displaydata;
-    void *dxgi_output = NULL;
     SDL_DisplayMode mode;
     SDL_DisplayOrientation natural_orientation;
     SDL_DisplayOrientation current_orientation;
@@ -568,9 +654,8 @@ static void WIN_AddDisplay(SDL_VideoDevice *_this, HMONITOR hMonitor, const MONI
     SDL_Log("Display: %s", WIN_StringToUTF8W(info->szDevice));
 #endif
 
-    dxgi_output = WIN_GetDXGIOutput(_this, info->szDevice);
-    bool found = WIN_GetDisplayMode(_this, dxgi_output, hMonitor, info->szDevice, ENUM_CURRENT_SETTINGS, &mode, &natural_orientation, &current_orientation);
-    WIN_ReleaseDXGIOutput(dxgi_output);
+    // This looks up the DXGI output itself if it turns out to need it
+    bool found = WIN_GetDisplayMode(_this, NULL, hMonitor, info->szDevice, ENUM_CURRENT_SETTINGS, &mode, &natural_orientation, &current_orientation);
     if (!found) {
         return;
     }

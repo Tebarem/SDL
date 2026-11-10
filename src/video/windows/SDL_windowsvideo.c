@@ -238,6 +238,37 @@ static void WIN_DeleteDevice(SDL_VideoDevice *device)
     SDL_free(device);
 }
 
+#ifdef HAVE_DXGI_H
+/* Creating a DXGI factory is slow enough to be a noticeable part of video
+ * startup, so it's only created the first time something asks for it.
+ */
+IDXGIFactory *WIN_GetDXGIFactory(SDL_VideoDevice *_this)
+{
+    SDL_VideoData *data = _this->internal;
+
+    if (!data->pDXGIFactory && !data->dxgi_factory_tried) {
+        data->dxgi_factory_tried = true;
+
+        data->dxgiDLL = SDL_LoadObject("DXGI.DLL");
+        if (data->dxgiDLL) {
+            /* *INDENT-OFF* */ // clang-format off
+            typedef HRESULT (WINAPI *pfnCreateDXGI)(REFIID riid, void **ppFactory);
+            /* *INDENT-ON* */ // clang-format on
+            pfnCreateDXGI pCreateDXGI;
+
+            pCreateDXGI = (pfnCreateDXGI)SDL_LoadFunction(data->dxgiDLL, "CreateDXGIFactory");
+            if (pCreateDXGI) {
+                GUID dxgiGUID = { 0x7b7166ec, 0x21c7, 0x44ae, { 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69 } };
+                pCreateDXGI(&dxgiGUID, (void **)&data->pDXGIFactory);
+            }
+        } else {
+            SDL_ClearError();
+        }
+    }
+    return data->pDXGIFactory;
+}
+#endif // HAVE_DXGI_H
+
 static SDL_VideoDevice *WIN_CreateDevice(void)
 {
     SDL_VideoDevice *device;
@@ -309,22 +340,6 @@ static SDL_VideoDevice *WIN_CreateDevice(void)
         SDL_ClearError();
     }
 #endif // #if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-
-#ifdef HAVE_DXGI_H
-    data->dxgiDLL = SDL_LoadObject("DXGI.DLL");
-    if (data->dxgiDLL) {
-        /* *INDENT-OFF* */ // clang-format off
-        typedef HRESULT (WINAPI *pfnCreateDXGI)(REFIID riid, void **ppFactory);
-        /* *INDENT-ON* */ // clang-format on
-        pfnCreateDXGI pCreateDXGI;
-
-        pCreateDXGI = (pfnCreateDXGI)SDL_LoadFunction(data->dxgiDLL, "CreateDXGIFactory");
-        if (pCreateDXGI) {
-            GUID dxgiGUID = { 0x7b7166ec, 0x21c7, 0x44ae, { 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69 } };
-            pCreateDXGI(&dxgiGUID, (void **)&data->pDXGIFactory);
-        }
-    }
-#endif
 
     // Set the function pointers
     device->VideoInit = WIN_VideoInit;
@@ -829,8 +844,8 @@ bool SDL_GetDXGIOutputInfo(SDL_DisplayID displayID, int *adapterIndex, int *outp
     }
     return SDL_SetError("SDL was compiled without DXGI support due to missing dxgi.h header");
 #else
-    const SDL_VideoDevice *videodevice = SDL_GetVideoDevice();
-    const SDL_VideoData *videodata = videodevice ? videodevice->internal : NULL;
+    SDL_VideoDevice *videodevice = SDL_GetVideoDevice();
+    IDXGIFactory *pDXGIFactory;
     SDL_DisplayData *pData = SDL_GetDisplayDriverData(displayID);
     int nAdapter, nOutput;
     IDXGIAdapter *pDXGIAdapter;
@@ -851,12 +866,13 @@ bool SDL_GetDXGIOutputInfo(SDL_DisplayID displayID, int *adapterIndex, int *outp
         return SDL_SetError("Invalid display index");
     }
 
-    if (!videodata || !videodata->pDXGIFactory) {
+    pDXGIFactory = videodevice ? WIN_GetDXGIFactory(videodevice) : NULL;
+    if (!pDXGIFactory) {
         return SDL_SetError("Unable to create DXGI interface");
     }
 
     nAdapter = 0;
-    while (*adapterIndex == -1 && SUCCEEDED(IDXGIFactory_EnumAdapters(videodata->pDXGIFactory, nAdapter, &pDXGIAdapter))) {
+    while (*adapterIndex == -1 && SUCCEEDED(IDXGIFactory_EnumAdapters(pDXGIFactory, nAdapter, &pDXGIAdapter))) {
         nOutput = 0;
         while (*adapterIndex == -1 && SUCCEEDED(IDXGIAdapter_EnumOutputs(pDXGIAdapter, nOutput, &pDXGIOutput))) {
             DXGI_OUTPUT_DESC outputDesc;

@@ -577,8 +577,10 @@ struct SDL_VideoData
 #endif                // !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
 
 #ifdef HAVE_DXGI_H
+    // Created on demand, use WIN_GetDXGIFactory() to get it
     SDL_SharedObject *dxgiDLL;
     IDXGIFactory *pDXGIFactory;
+    bool dxgi_factory_tried;
 #endif
 
     bool cleared;
@@ -667,5 +669,9 @@ extern bool D3D_LoadDLL(void **pD3DDLL, IDirect3D9 **pDirect3D9Interface);
 
 extern SDL_SystemTheme WIN_GetSystemTheme(void);
 extern bool WIN_IsPerMonitorV2DPIAware(SDL_VideoDevice *_this);
+
+#ifdef HAVE_DXGI_H
+extern IDXGIFactory *WIN_GetDXGIFactory(SDL_VideoDevice *_this);
+#endif
 
 #endif // SDL_windowsvideo_h_
