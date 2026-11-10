@@ -174,6 +174,15 @@ FARPROC WIN_LoadComBaseFunction(const char *name);
 extern HRESULT WIN_CoInitialize(void);
 extern void WIN_CoUninitialize(void);
 
+/* Release the Direct3D 12 device held by the optional GPU warm-up, if any.
+ * This is implemented by the Windows video driver, and must be called before
+ * enabling the Direct3D 12 debug layer. */
+extern void WIN_ReleaseGPUWarmupD3D12(void);
+
+/* Release the Direct3D 11 device held by the optional GPU warm-up, if any.
+ * Call this once a real Direct3D 11 device has been created. */
+extern void WIN_ReleaseGPUWarmupD3D11(void);
+
 // Wrap up the oddities of RoInitialize() into a common function.
 extern HRESULT WIN_RoInitialize(void);
 extern void WIN_RoUninitialize(void);

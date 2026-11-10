@@ -866,7 +866,12 @@ static HRESULT D3D12_CreateDeviceResources(SDL_Renderer *renderer)
     if (createDebug) {
         PFN_D3D12_GET_DEBUG_INTERFACE D3D12GetDebugInterfaceFunc;
 
-        D3D12GetDebugInterfaceFunc = (PFN_D3D12_GET_DEBUG_INTERFACE)SDL_LoadFunction(data->hD3D12Mod, "D3D12GetDebugInterface");
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+        // The debug layer has to be enabled before any device exists
+        WIN_ReleaseGPUWarmupD3D12();
+#endif
+
+        D3D12GetDebugInterfaceFunc =(PFN_D3D12_GET_DEBUG_INTERFACE)SDL_LoadFunction(data->hD3D12Mod, "D3D12GetDebugInterface");
         if (!D3D12GetDebugInterfaceFunc) {
             result = E_FAIL;
             goto done;

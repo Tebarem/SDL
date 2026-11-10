@@ -39,6 +39,10 @@
 #if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
 #include <shobjidl.h>
 
+#ifdef HAVE_DXGI1_6_H
+#include <dxgi1_6.h>
+#endif
+
 #ifndef __ITaskbarList3_FWD_DEFINED__
 typedef struct ITaskbarList3 ITaskbarList3;
 #endif
@@ -617,10 +621,211 @@ static void WIN_InitDPIAwareness(SDL_VideoDevice *_this)
     }
 }
 
+#if defined(HAVE_DXGI_H) && !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
+#define SDL_WINDOWS_GPU_WARMUP
+
+/* Optional warm-up of the graphics driver.
+ *
+ * Creating a Direct3D device is mostly the driver initializing itself, which
+ * can take hundreds of milliseconds of CPU time on the calling thread. If the
+ * application sets the "SDL_WINDOWS_GPU_WARMUP" hint to a list of drivers
+ * ("direct3d11", "direct3d12") before initializing video, we create a device
+ * for each on a background thread and keep it until video shuts down. That
+ * work then overlaps with whatever the application does between SDL_Init()
+ * and creating its renderer or GPU device:
+ *
+ * - Direct3D 12 devices are singletons per adapter, so a later creation
+ *   returns the device we're holding.
+ * - Direct3D 11 devices aren't shared, but most of the cost is loading the
+ *   driver, which stays loaded while our device is alive.
+ */
+typedef struct WIN_GPUWarmup
+{
+    SDL_Thread *thread;
+    bool want_d3d11;
+    bool want_d3d12;
+    SDL_SharedObject *dxgiDLL;
+    SDL_SharedObject *d3d11DLL;
+    SDL_SharedObject *d3d12DLL;
+    IUnknown *d3d11Device;
+    IUnknown *d3d12Device;
+} WIN_GPUWarmup;
+
+static WIN_GPUWarmup gpu_warmup;
+
+static int SDLCALL WIN_GPUWarmupThread(void *userdata)
+{
+    /* *INDENT-OFF* */ // clang-format off
+    typedef HRESULT (WINAPI *pfnCreateDXGIFactory1)(REFIID riid, void **ppFactory);
+    typedef HRESULT (WINAPI *pfnD3D11CreateDevice)(IDXGIAdapter *adapter, int driverType, HMODULE software, UINT flags, const int *featureLevels, UINT numFeatureLevels, UINT sdkVersion, void **device, int *featureLevel, void **context);
+    typedef HRESULT (WINAPI *pfnD3D12CreateDevice)(IUnknown *adapter, int minimumFeatureLevel, REFIID riid, void **device);
+    /* *INDENT-ON* */ // clang-format on
+    static const GUID SDL_IID_IDXGIFactory1 = { 0x770aae78, 0xf26f, 0x4dba, { 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87 } };
+    static const GUID SDL_IID_ID3D12Device = { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
+    WIN_GPUWarmup *warmup = (WIN_GPUWarmup *)userdata;
+    pfnCreateDXGIFactory1 pCreateDXGIFactory1;
+    IDXGIFactory1 *factory = NULL;
+
+    warmup->dxgiDLL = SDL_LoadObject("dxgi.dll");
+    if (!warmup->dxgiDLL) {
+        return 0;
+    }
+    pCreateDXGIFactory1 = (pfnCreateDXGIFactory1)SDL_LoadFunction(warmup->dxgiDLL, "CreateDXGIFactory1");
+    if (!pCreateDXGIFactory1 || FAILED(pCreateDXGIFactory1(&SDL_IID_IDXGIFactory1, (void **)&factory))) {
+        return 0;
+    }
+
+    if (warmup->want_d3d12) {
+        // Use the adapter the Direct3D 12 renderer and GPU backend pick by default
+        IDXGIAdapter1 *adapter = NULL;
+#ifdef HAVE_DXGI1_6_H
+        static const GUID SDL_IID_IDXGIFactory6 = { 0xc1b6694f, 0xff09, 0x44a9, { 0xb0, 0x3c, 0x77, 0x90, 0x0a, 0x0a, 0x1d, 0x17 } };
+        static const GUID SDL_IID_IDXGIAdapter1 = { 0x29038f61, 0x3839, 0x4626, { 0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05 } };
+        IDXGIFactory6 *factory6 = NULL;
+        if (SUCCEEDED(IDXGIFactory1_QueryInterface(factory, &SDL_IID_IDXGIFactory6, (void **)&factory6))) {
+            if (FAILED(IDXGIFactory6_EnumAdapterByGpuPreference(factory6, 0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &SDL_IID_IDXGIAdapter1, (void **)&adapter))) {
+                adapter = NULL;
+            }
+            IDXGIFactory6_Release(factory6);
+        }
+#endif
+        if (!adapter && FAILED(IDXGIFactory1_EnumAdapters1(factory, 0, &adapter))) {
+            adapter = NULL;
+        }
+        if (adapter) {
+            warmup->d3d12DLL = SDL_LoadObject("D3D12.dll");
+            if (warmup->d3d12DLL) {
+                pfnD3D12CreateDevice pD3D12CreateDevice = (pfnD3D12CreateDevice)SDL_LoadFunction(warmup->d3d12DLL, "D3D12CreateDevice");
+                if (pD3D12CreateDevice) {
+                    // 0xb000 is D3D_FEATURE_LEVEL_11_0
+                    if (FAILED(pD3D12CreateDevice((IUnknown *)adapter, 0xb000, &SDL_IID_ID3D12Device, (void **)&warmup->d3d12Device))) {
+                        warmup->d3d12Device = NULL;
+                    }
+                }
+            }
+            IDXGIAdapter1_Release(adapter);
+        }
+    }
+
+    if (warmup->want_d3d11) {
+        // The Direct3D 11 renderer uses the first adapter
+        IDXGIAdapter1 *adapter = NULL;
+        if (SUCCEEDED(IDXGIFactory1_EnumAdapters1(factory, 0, &adapter))) {
+            warmup->d3d11DLL = SDL_LoadObject("d3d11.dll");
+            if (warmup->d3d11DLL) {
+                pfnD3D11CreateDevice pD3D11CreateDevice = (pfnD3D11CreateDevice)SDL_LoadFunction(warmup->d3d11DLL, "D3D11CreateDevice");
+                if (pD3D11CreateDevice) {
+                    // Driver type 0 is D3D_DRIVER_TYPE_UNKNOWN, 0x20 is D3D11_CREATE_DEVICE_BGRA_SUPPORT, 7 is D3D11_SDK_VERSION
+                    IUnknown *context = NULL;
+                    if (FAILED(pD3D11CreateDevice((IDXGIAdapter *)adapter, 0, NULL, 0x20, NULL, 0, 7, (void **)&warmup->d3d11Device, NULL, (void **)&context))) {
+                        warmup->d3d11Device = NULL;
+                    }
+                    if (context) {
+                        IUnknown_Release(context);
+                    }
+                }
+            }
+            IDXGIAdapter1_Release(adapter);
+        }
+    }
+
+    IDXGIFactory1_Release(factory);
+    SDL_ClearError();
+    return 0;
+}
+
+static void WIN_StartGPUWarmup(void)
+{
+    const char *hint = SDL_GetHint("SDL_WINDOWS_GPU_WARMUP");
+
+    if (!hint || !*hint || gpu_warmup.thread) {
+        return;
+    }
+
+    SDL_zero(gpu_warmup);
+    gpu_warmup.want_d3d11 = (SDL_strstr(hint, "direct3d11") != NULL);
+    gpu_warmup.want_d3d12 = (SDL_strstr(hint, "direct3d12") != NULL);
+    if (!gpu_warmup.want_d3d11 && !gpu_warmup.want_d3d12) {
+        return;
+    }
+
+    gpu_warmup.thread = SDL_CreateThread(WIN_GPUWarmupThread, "SDLGPUWarmup", &gpu_warmup);
+    if (!gpu_warmup.thread) {
+        SDL_ClearError();
+    }
+}
+
+static void WIN_WaitForGPUWarmup(void)
+{
+    if (gpu_warmup.thread) {
+        SDL_WaitThread(gpu_warmup.thread, NULL);
+        gpu_warmup.thread = NULL;
+    }
+}
+
+static void WIN_StopGPUWarmup(void)
+{
+    WIN_WaitForGPUWarmup();
+
+    if (gpu_warmup.d3d11Device) {
+        IUnknown_Release(gpu_warmup.d3d11Device);
+    }
+    if (gpu_warmup.d3d12Device) {
+        IUnknown_Release(gpu_warmup.d3d12Device);
+    }
+    if (gpu_warmup.d3d11DLL) {
+        SDL_UnloadObject(gpu_warmup.d3d11DLL);
+    }
+    if (gpu_warmup.d3d12DLL) {
+        SDL_UnloadObject(gpu_warmup.d3d12DLL);
+    }
+    if (gpu_warmup.dxgiDLL) {
+        SDL_UnloadObject(gpu_warmup.dxgiDLL);
+    }
+    SDL_zero(gpu_warmup);
+}
+#endif // HAVE_DXGI_H && !XBOX
+
+/* The Direct3D 12 debug layer has to be enabled before any device exists, so
+ * anything that's about to enable it needs to get rid of the warm-up device
+ * first. Call this from the thread that's creating the renderer or GPU device.
+ */
+void WIN_ReleaseGPUWarmupD3D12(void)
+{
+#ifdef SDL_WINDOWS_GPU_WARMUP
+    WIN_WaitForGPUWarmup();
+
+    if (gpu_warmup.d3d12Device) {
+        IUnknown_Release(gpu_warmup.d3d12Device);
+        gpu_warmup.d3d12Device = NULL;
+    }
+#endif
+}
+
+/* Once a real Direct3D 11 device exists it keeps the driver loaded by itself,
+ * and holding on to the warm-up device would only cost memory.
+ */
+void WIN_ReleaseGPUWarmupD3D11(void)
+{
+#ifdef SDL_WINDOWS_GPU_WARMUP
+    WIN_WaitForGPUWarmup();
+
+    if (gpu_warmup.d3d11Device) {
+        IUnknown_Release(gpu_warmup.d3d11Device);
+        gpu_warmup.d3d11Device = NULL;
+    }
+#endif
+}
+
 static bool WIN_VideoInit(SDL_VideoDevice *_this)
 {
     SDL_VideoData *data = _this->internal;
     HRESULT hr;
+
+#ifdef SDL_WINDOWS_GPU_WARMUP
+    // Start this first so it overlaps with as much of startup as possible
+    WIN_StartGPUWarmup();
+#endif
 
     hr = WIN_CoInitialize();
     if (SUCCEEDED(hr)) {
@@ -708,6 +913,10 @@ void WIN_VideoQuit(SDL_VideoDevice *_this)
 
     WIN_QuitRawInput(_this);
     WIN_QuitGameInput(_this);
+
+#ifdef SDL_WINDOWS_GPU_WARMUP
+    WIN_StopGPUWarmup();
+#endif
 
 #if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
     WIN_QuitModes(_this);

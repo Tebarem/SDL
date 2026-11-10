@@ -679,6 +679,11 @@ static HRESULT D3D11_CreateDeviceResources(SDL_Renderer *renderer)
         goto done;
     }
 
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+    // Our device keeps the driver loaded from here on
+    WIN_ReleaseGPUWarmupD3D11();
+#endif
+
     result = ID3D11Device_QueryInterface(d3dDevice, &SDL_IID_ID3D11Device1, (void **)&data->d3dDevice);
     if (FAILED(result)) {
         WIN_SetErrorFromHRESULT("ID3D11Device to ID3D11Device1", result);

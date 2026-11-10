@@ -9752,6 +9752,11 @@ static SDL_GPUDevice *D3D12_CreateDevice(bool debugMode, bool preferLowPower, SD
     if (debugMode || factory) {
         D3D12_ReleasePreparedDriver();
     }
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+    if (debugMode) {
+        WIN_ReleaseGPUWarmupD3D12();
+    }
+#endif
 #endif
 
     // Initialize the D3D12 debug layer, if applicable
