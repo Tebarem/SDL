@@ -12879,6 +12879,81 @@ static XrResult VULKAN_INTERNAL_GetXrMinimumVulkanApiVersion(XrVersion *minimumV
 }
 #endif // HAVE_GPU_OPENXR
 
+/* Creating a Vulkan instance and picking a physical device is slow, and
+ * PrepareDriver has to do both to know whether the driver is usable. Rather
+ * than throwing that work away and repeating it in CreateDevice, a successful
+ * PrepareDriver leaves its renderer here for CreateDevice to pick up.
+ */
+typedef struct VulkanPreparedDriver
+{
+    VulkanRenderer *renderer;
+    VulkanFeatures features;
+    SDL_PropertiesID props;
+} VulkanPreparedDriver;
+
+static void *s_PreparedDriver;
+
+static void VULKAN_INTERNAL_DestroyPreparedDriver(VulkanPreparedDriver *prepared)
+{
+    if (prepared) {
+        prepared->renderer->vkDestroyInstance(prepared->renderer->instance, NULL);
+        SDL_free(prepared->renderer);
+        SDL_free(prepared);
+        SDL_Vulkan_UnloadLibrary();
+    }
+}
+
+// On success this owns the renderer, and holds its own reference to the Vulkan library
+static bool VULKAN_INTERNAL_KeepPreparedDriver(VulkanRenderer *renderer, const VulkanFeatures *features, SDL_PropertiesID props)
+{
+    VulkanPreparedDriver *prepared = (VulkanPreparedDriver *)SDL_calloc(1, sizeof(*prepared));
+    if (!prepared) {
+        return false;
+    }
+
+    if (!SDL_Vulkan_LoadLibrary(NULL)) {
+        SDL_free(prepared);
+        return false;
+    }
+
+    prepared->renderer = renderer;
+    prepared->features = *features;
+    prepared->props = props;
+
+    VULKAN_INTERNAL_DestroyPreparedDriver((VulkanPreparedDriver *)SDL_SetAtomicPointer(&s_PreparedDriver, prepared));
+    return true;
+}
+
+/* Returns the renderer PrepareDriver left behind if it was prepared with the
+ * same settings, along with the library reference it was holding.
+ */
+static VulkanRenderer *VULKAN_INTERNAL_TakePreparedDriver(bool debugMode, bool preferLowPower, SDL_PropertiesID props, VulkanFeatures *features)
+{
+    VulkanPreparedDriver *prepared = (VulkanPreparedDriver *)SDL_SetAtomicPointer(&s_PreparedDriver, NULL);
+    VulkanRenderer *renderer;
+
+    if (!prepared) {
+        return NULL;
+    }
+
+    renderer = prepared->renderer;
+    if (prepared->props != props ||
+        renderer->debugMode != debugMode ||
+        renderer->preferLowPower != preferLowPower) {
+        VULKAN_INTERNAL_DestroyPreparedDriver(prepared);
+        return NULL;
+    }
+
+    *features = prepared->features;
+    SDL_free(prepared);
+    return renderer;
+}
+
+static void VULKAN_ReleasePreparedDriver(void)
+{
+    VULKAN_INTERNAL_DestroyPreparedDriver((VulkanPreparedDriver *)SDL_SetAtomicPointer(&s_PreparedDriver, NULL));
+}
+
 static bool VULKAN_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
 {
     // Set up dummy VulkanRenderer
@@ -13005,7 +13080,18 @@ static bool VULKAN_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
 
         result = VULKAN_INTERNAL_PrepareVulkan(renderer, &features, props);
         if (result) {
-            renderer->vkDestroyInstance(renderer->instance, NULL);
+            // An instance created through OpenXR dies with the XR instance below, so it can't be kept
+            bool keep = true;
+#ifdef HAVE_GPU_OPENXR
+            if (xr) {
+                keep = false;
+            }
+#endif
+            if (keep && VULKAN_INTERNAL_KeepPreparedDriver(renderer, &features, props)) {
+                renderer = NULL;
+            } else {
+                renderer->vkDestroyInstance(renderer->instance, NULL);
+            }
         }
 
 #ifdef HAVE_GPU_OPENXR
@@ -13374,7 +13460,13 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
     }
 #endif // HAVE_GPU_OPENXR
 
-    if (!VULKAN_INTERNAL_PrepareVulkan(renderer, &features, props)) {
+    VulkanRenderer *preparedRenderer = VULKAN_INTERNAL_TakePreparedDriver(debugMode, preferLowPower, props, &features);
+    if (preparedRenderer) {
+        // PrepareDriver already did this work with the same settings
+        SDL_free(renderer);
+        renderer = preparedRenderer;
+        renderer->allowedFramesInFlight = 2;
+    } else if (!VULKAN_INTERNAL_PrepareVulkan(renderer, &features, props)) {
         SET_STRING_ERROR("Failed to initialize Vulkan!");
 #ifdef HAVE_GPU_OPENXR
         if (xr) {
@@ -13695,7 +13787,8 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
 SDL_GPUBootstrap VulkanDriver = {
     "vulkan",
     VULKAN_PrepareDriver,
-    VULKAN_CreateDevice
+    VULKAN_CreateDevice,
+    VULKAN_ReleasePreparedDriver
 };
 
 #endif // SDL_GPU_VULKAN
