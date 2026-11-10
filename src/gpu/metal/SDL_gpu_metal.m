@@ -25,6 +25,7 @@
 
 #include <Metal/Metal.h>
 #include <QuartzCore/CoreAnimation.h>
+#include <IOSurface/IOSurface.h>
 
 #ifdef HAVE_GPU_OPENXR
 #define XR_USE_GRAPHICS_API_METAL 1
@@ -4568,6 +4569,78 @@ static XrResult METAL_CreateXRSession(
 {
     SDL_SetError("The metal backend does not currently support OpenXR");
     return XR_ERROR_FUNCTION_UNSUPPORTED;
+}
+
+static bool METAL_CopyExternalTexture(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_FalconExternalTexture *source,
+    SDL_GPUTexture *destination)
+{
+    @autoreleasepool {
+        MetalRenderer *renderer = (MetalRenderer *)driverData;
+        MetalCommandBuffer *metalCommandBuffer =
+            (MetalCommandBuffer *)commandBuffer;
+        MetalTextureContainer *destinationContainer =
+            (MetalTextureContainer *)destination;
+        MTLTextureDescriptor *descriptor;
+        id<MTLTexture> sourceTexture;
+        MetalTexture *destinationTexture;
+
+        if (source == NULL || destination == NULL ||
+            source->struct_size < sizeof(*source) ||
+            source->version != SDL_FALCON_EXTERNAL_TEXTURE_VERSION ||
+            source->kind != SDL_FALCON_EXTERNAL_TEXTURE_IOSURFACE ||
+            source->native.handle == NULL || source->plane_count != 0 ||
+            source->width == 0 || source->height == 0 ||
+            source->width > destinationContainer->header.info.width ||
+            source->height > destinationContainer->header.info.height ||
+            source->format != destinationContainer->header.info.format) {
+            SDL_SetError("Invalid IOSurface texture import arguments");
+            return false;
+        }
+
+        descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            SDLToMetal_TextureFormat(source->format)
+            width:source->width
+            height:source->height
+            mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        sourceTexture = [renderer->device newTextureWithDescriptor:descriptor
+            iosurface:(IOSurfaceRef)source->native.handle
+            plane:0];
+        if (sourceTexture == nil) {
+            SDL_SetError("Could not wrap CEF IOSurface as a Metal texture");
+            return false;
+        }
+        destinationTexture = METAL_INTERNAL_PrepareTextureForWrite(
+            renderer,
+            destinationContainer,
+            false);
+        if (metalCommandBuffer->blitEncoder == nil) {
+            metalCommandBuffer->blitEncoder =
+                [metalCommandBuffer->handle blitCommandEncoder];
+        }
+        if (destinationTexture == NULL ||
+            metalCommandBuffer->blitEncoder == nil) {
+            SDL_SetError("Could not create the Metal UI texture copy pass");
+            return false;
+        }
+
+        [metalCommandBuffer->blitEncoder
+            copyFromTexture:sourceTexture
+            sourceSlice:0
+            sourceLevel:0
+            sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(source->width, source->height, 1)
+            toTexture:destinationTexture->handle
+            destinationSlice:0
+            destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        METAL_INTERNAL_TrackTexture(metalCommandBuffer, destinationTexture);
+        return true;
+    }
 }
 
 static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SDL_PropertiesID props)

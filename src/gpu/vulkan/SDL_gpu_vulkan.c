@@ -1254,6 +1254,20 @@ struct VulkanRenderer
 static bool VULKAN_INTERNAL_DefragmentMemory(VulkanRenderer *renderer, VulkanCommandBuffer *commandBuffer);
 static bool VULKAN_INTERNAL_BeginCommandBuffer(VulkanRenderer *renderer, VulkanCommandBuffer *commandBuffer);
 static void VULKAN_ReleaseTexture(SDL_GPURenderer *driverData, SDL_GPUTexture *texture);
+
+static bool VULKAN_CopyExternalTexture(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_FalconExternalTexture *source,
+    SDL_GPUTexture *destination)
+{
+    (void)driverData;
+    (void)commandBuffer;
+    (void)source;
+    (void)destination;
+    SDL_SetError("Vulkan external texture import is not implemented");
+    return false;
+}
 static void VULKAN_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window);
 static bool VULKAN_Wait(SDL_GPURenderer *driverData);
 static bool VULKAN_WaitForFences(SDL_GPURenderer *driverData, bool waitAll, SDL_GPUFence *const *fences, Uint32 numFences);

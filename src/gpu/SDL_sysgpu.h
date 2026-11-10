@@ -20,6 +20,7 @@
 */
 #include "../video/SDL_sysvideo.h"
 #include "SDL_internal.h"
+#include <SDL3/SDL_falcon_gpu.h>
 
 #ifndef SDL_GPU_DRIVER_H
 #define SDL_GPU_DRIVER_H
@@ -700,6 +701,12 @@ struct SDL_GPUDevice
         SDL_GPURenderer *driverData,
         const SDL_GPUTextureCreateInfo *createinfo);
 
+    bool (*CopyExternalTexture)(
+        SDL_GPURenderer *driverData,
+        SDL_GPUCommandBuffer *commandBuffer,
+        const SDL_FalconExternalTexture *source,
+        SDL_GPUTexture *destination);
+
     SDL_GPUBuffer *(*CreateBuffer)(
         SDL_GPURenderer *driverData,
         SDL_GPUBufferUsageFlags usageFlags,
@@ -1139,6 +1146,7 @@ struct SDL_GPUDevice
     ASSIGN_DRIVER_FUNC(CreateSampler, name)                 \
     ASSIGN_DRIVER_FUNC(CreateShader, name)                  \
     ASSIGN_DRIVER_FUNC(CreateTexture, name)                 \
+    ASSIGN_DRIVER_FUNC(CopyExternalTexture, name)             \
     ASSIGN_DRIVER_FUNC(CreateBuffer, name)                  \
     ASSIGN_DRIVER_FUNC(CreateTransferBuffer, name)          \
     ASSIGN_DRIVER_FUNC(CreateXRSession, name)               \

@@ -1107,6 +1107,10 @@ struct D3D12CommandBuffer
     D3D12UniformBuffer *computeUniformBuffers[MAX_UNIFORM_BUFFERS_PER_STAGE];
 
     // Resource tracking
+    ID3D12Resource **externalResources;
+    Uint32 externalResourceCount;
+    Uint32 externalResourceCapacity;
+
     D3D12Texture **usedTextures;
     Uint32 usedTextureCount;
     Uint32 usedTextureCapacity;
@@ -1628,6 +1632,10 @@ static void D3D12_INTERNAL_DestroyCommandBuffer(D3D12CommandBuffer *commandBuffe
     SDL_free(commandBuffer->usedDescriptorHeaps);
     SDL_free(commandBuffer->usedUniformBuffers);
     SDL_free(commandBuffer->textureDownloads);
+    for (Uint32 i = 0; i < commandBuffer->externalResourceCount; i += 1) {
+        ID3D12Resource_Release(commandBuffer->externalResources[i]);
+    }
+    SDL_free(commandBuffer->externalResources);
     SDL_free(commandBuffer);
 }
 
@@ -2092,6 +2100,34 @@ static void D3D12_INTERNAL_TrackTexture(
         usedTextures,
         usedTextureCount,
         usedTextureCapacity)
+}
+
+static bool D3D12_INTERNAL_TrackExternalResource(
+    D3D12CommandBuffer *commandBuffer,
+    ID3D12Resource *resource)
+{
+    for (Uint32 i = 0; i < commandBuffer->externalResourceCount; i += 1) {
+        if (commandBuffer->externalResources[i] == resource) {
+            return true;
+        }
+    }
+
+    if (commandBuffer->externalResourceCount ==
+        commandBuffer->externalResourceCapacity) {
+        const Uint32 newCapacity = commandBuffer->externalResourceCapacity + 1;
+        ID3D12Resource **resources = (ID3D12Resource **)SDL_realloc(
+            commandBuffer->externalResources,
+            newCapacity * sizeof(ID3D12Resource *));
+        if (resources == NULL) {
+            return false;
+        }
+        commandBuffer->externalResources = resources;
+        commandBuffer->externalResourceCapacity = newCapacity;
+    }
+
+    commandBuffer->externalResources[
+        commandBuffer->externalResourceCount++] = resource;
+    return true;
 }
 
 static void D3D12_INTERNAL_TrackBuffer(
@@ -6230,6 +6266,120 @@ static void D3D12_CopyTextureToTexture(
         destinationSubresource->parent);
 }
 
+static bool D3D12_CopyExternalTexture(
+    SDL_GPURenderer *driverData,
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_FalconExternalTexture *source,
+    SDL_GPUTexture *destination)
+{
+    D3D12Renderer *renderer = (D3D12Renderer *)driverData;
+    D3D12CommandBuffer *d3d12CommandBuffer =
+        (D3D12CommandBuffer *)commandBuffer;
+    D3D12TextureContainer *destinationContainer =
+        (D3D12TextureContainer *)destination;
+    ID3D12Resource *sourceResource = NULL;
+    D3D12_RESOURCE_DESC sourceDesc;
+    D3D12TextureSubresource *destinationSubresource;
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation;
+    D3D12_TEXTURE_COPY_LOCATION destinationLocation;
+    HRESULT res;
+
+    if (source == NULL || source->struct_size < sizeof(*source) ||
+        source->version != SDL_FALCON_EXTERNAL_TEXTURE_VERSION ||
+        source->kind != SDL_FALCON_EXTERNAL_TEXTURE_D3D12_SHARED_HANDLE ||
+        source->native.handle == NULL || destination == NULL ||
+        source->width == 0 || source->height == 0 ||
+        source->width > destinationContainer->header.info.width ||
+        source->height > destinationContainer->header.info.height ||
+        (source->format != SDL_GPU_TEXTUREFORMAT_INVALID &&
+         source->format != destinationContainer->header.info.format)) {
+        SDL_SetError("Invalid external D3D12 texture source");
+        return false;
+    }
+
+    res = ID3D12Device_OpenSharedHandle(
+        renderer->device,
+        (HANDLE)source->native.handle,
+        D3D_GUID(D3D_IID_ID3D12Resource),
+        (void **)&sourceResource);
+    if (FAILED(res)) {
+        D3D12_INTERNAL_SetError(
+            renderer,
+            "Failed to open external D3D12 texture for copy!",
+            res);
+        return false;
+    }
+
+    ID3D12Resource_GetDesc(sourceResource, &sourceDesc);
+    if (sourceDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        sourceDesc.Width < source->width ||
+        sourceDesc.Height < source->height ||
+        sourceDesc.Format != SDLToD3D12_TextureFormat[
+            destinationContainer->header.info.format]) {
+        SDL_SetError("External D3D12 texture description is incompatible");
+        ID3D12Resource_Release(sourceResource);
+        return false;
+    }
+
+    if (!D3D12_INTERNAL_TrackExternalResource(
+            d3d12CommandBuffer,
+            sourceResource)) {
+        SDL_SetError("Could not retain external D3D12 texture");
+        ID3D12Resource_Release(sourceResource);
+        return false;
+    }
+
+    destinationSubresource = D3D12_INTERNAL_PrepareTextureSubresourceForWrite(
+        d3d12CommandBuffer,
+        destinationContainer,
+        0,
+        0,
+        false,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_INTERNAL_ResourceBarrier(
+        d3d12CommandBuffer,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        sourceResource,
+        0,
+        false);
+
+    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    sourceLocation.SubresourceIndex = 0;
+    sourceLocation.pResource = sourceResource;
+    destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destinationLocation.SubresourceIndex = destinationSubresource->index;
+    destinationLocation.pResource = destinationSubresource->parent->resource;
+
+    D3D12_BOX sourceBox = {
+        0, 0, 0, source->width, source->height, 1};
+    ID3D12GraphicsCommandList_CopyTextureRegion(
+        d3d12CommandBuffer->graphicsCommandList,
+        &destinationLocation,
+        0,
+        0,
+        0,
+        &sourceLocation,
+        &sourceBox);
+
+    D3D12_INTERNAL_ResourceBarrier(
+        d3d12CommandBuffer,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COMMON,
+        sourceResource,
+        0,
+        false);
+    D3D12_INTERNAL_TextureSubresourceTransitionToDefaultUsage(
+        d3d12CommandBuffer,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        destinationSubresource);
+    D3D12_INTERNAL_TrackTexture(
+        d3d12CommandBuffer,
+        destinationSubresource->parent);
+    return true;
+}
+
 static void D3D12_CopyBufferToBuffer(
     SDL_GPUCommandBuffer *commandBuffer,
     const SDL_GPUBufferLocation *source,
@@ -7834,6 +7984,11 @@ static bool D3D12_INTERNAL_CleanCommandBuffer(
     if (!result) {
         return false;
     }
+
+    for (i = 0; i < commandBuffer->externalResourceCount; i += 1) {
+        ID3D12Resource_Release(commandBuffer->externalResources[i]);
+    }
+    commandBuffer->externalResourceCount = 0;
 
     res = ID3D12CommandAllocator_Reset(commandBuffer->commandAllocator);
     CHECK_D3D12_ERROR_AND_RETURN("Could not reset command allocator", false);
