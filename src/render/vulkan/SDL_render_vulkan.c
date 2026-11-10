@@ -2296,10 +2296,10 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer, SDL_Propert
         return result;
     }
 
-    // Create default vertex buffers
-    for (uint32_t i = 0; i < SDL_VULKAN_NUM_VERTEX_BUFFERS; ++i) {
-        VULKAN_CreateVertexBuffer(rendererData, i, SDL_VULKAN_VERTEX_BUFFER_DEFAULT_SIZE);
-    }
+    /* The vertex buffers are created the first time each one is used, in
+     * VULKAN_UpdateVertexBuffer(). Creating all of them here made renderer
+     * creation noticeably slower.
+     */
 
     SDL_PropertiesID props = SDL_GetRendererProperties(renderer);
     SDL_SetPointerProperty(props, SDL_PROP_RENDERER_VULKAN_INSTANCE_POINTER, rendererData->instance);
@@ -3890,11 +3890,16 @@ static bool VULKAN_UpdateVertexBuffer(SDL_Renderer *renderer,
             return SDL_SetError("Failed to issue intermediate batch");
         }
     }
-    // If the existing vertex buffer isn't big enough, we need to recreate a big enough one
+    // If the vertex buffer doesn't exist yet or isn't big enough, we need to create a big enough one
     if (dataSizeInBytes > rendererData->vertexBuffers[vbidx].size) {
-        VULKAN_IssueBatch(rendererData);
-        VULKAN_WaitForGPU(rendererData);
-        VULKAN_CreateVertexBuffer(rendererData, vbidx, dataSizeInBytes);
+        if (rendererData->vertexBuffers[vbidx].buffer != VK_NULL_HANDLE) {
+            // The buffer we're replacing may still be in use
+            VULKAN_IssueBatch(rendererData);
+            VULKAN_WaitForGPU(rendererData);
+        }
+        if (VULKAN_CreateVertexBuffer(rendererData, vbidx, SDL_max(dataSizeInBytes, SDL_VULKAN_VERTEX_BUFFER_DEFAULT_SIZE)) != VK_SUCCESS) {
+            return false;
+        }
     }
 
     vertexBuffer = &rendererData->vertexBuffers[vbidx];

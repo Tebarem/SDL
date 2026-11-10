@@ -755,6 +755,7 @@ static HRESULT D3D12_CreateVertexBuffer(D3D12_RenderData *data, size_t vbidx, si
     HRESULT result;
 
     D3D_SAFE_RELEASE(data->vertexBuffers[vbidx].resource);
+    data->vertexBuffers[vbidx].size = 0;
 
     SDL_zero(vbufferHeapProps);
     vbufferHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -1126,10 +1127,10 @@ static HRESULT D3D12_CreateDeviceResources(SDL_Renderer *renderer)
         }
     }
 
-    // Create default vertex buffers
-    for (i = 0; i < SDL_D3D12_NUM_VERTEX_BUFFERS; ++i) {
-        D3D12_CreateVertexBuffer(data, i, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
-    }
+    /* The vertex buffers are created the first time each one is used, in
+     * D3D12_UpdateVertexBuffer(). Creating all of them here made renderer
+     * creation noticeably slower.
+     */
 
     // Create samplers to use when drawing textures:
     D3D_CALL_RET(data->samplerDescriptorHeap, GetCPUDescriptorHandleForHeapStart, &data->samplers[0]);
@@ -2542,9 +2543,11 @@ static bool D3D12_UpdateVertexBuffer(SDL_Renderer *renderer,
         }
     }
 
-    // If the existing vertex buffer isn't big enough, we need to recreate a big enough one
+    // If the vertex buffer doesn't exist yet or isn't big enough, we need to create a big enough one
     if (dataSizeInBytes > rendererData->vertexBuffers[vbidx].size) {
-        D3D12_CreateVertexBuffer(rendererData, vbidx, dataSizeInBytes);
+        if (FAILED(D3D12_CreateVertexBuffer(rendererData, vbidx, SDL_max(dataSizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)))) {
+            return false;
+        }
     }
 
     vertexBuffer = rendererData->vertexBuffers[vbidx].resource;
