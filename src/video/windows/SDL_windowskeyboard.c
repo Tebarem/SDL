@@ -134,7 +134,8 @@ static SDL_Keymap *WIN_BuildKeymap(void)
     for (int m = 0; m < SDL_arraysize(mods); ++m) {
         for (int i = 0; i < SDL_arraysize(windows_scancode_table); i++) {
             int vk, sc, result;
-            Uint32 *ch = 0;
+            int length, consumed = 0;
+            Uint32 ch;
 
             // Make sure this scancode is a valid character scancode
             scancode = windows_scancode_table[i];
@@ -170,22 +171,27 @@ static SDL_Keymap *WIN_BuildKeymap(void)
             keyboardState[VK_MENU] = (mods[m] & SDL_KMOD_MODE) ? 0x80 : 0x00;
 
             result = ToUnicode(vk, sc, keyboardState, buffer, 16, 0);
-            buffer[SDL_abs(result)] = 0;
+            length = SDL_abs(result);
 
-            // Convert UTF-16 to UTF-32 code points
-            ch = (Uint32 *)SDL_iconv_string("UTF-32LE", "UTF-16LE", (const char *)buffer, (SDL_abs(result) + 1) * sizeof(WCHAR));
-            if (ch) {
-                /* Windows keyboard layouts can emit several UTF-32 code points on a single key press.
-                 * Use <U+FFFD REPLACEMENT CHARACTER> since we cannot fit into single SDL_Keycode value in SDL keymap.
-                 * See https://kbdlayout.info/features/ligatures for a list of such keys. */
-                SDL_SetKeymapEntry(keymap, scancode, mods[m], ch[1] == 0 ? ch[0] : 0xfffd);
-                SDL_free(ch);
+            /* Convert UTF-16 to a UTF-32 code point. This is done by hand because
+             * it runs for every key and modifier combination at startup. */
+            if (length == 0) {
+                ch = 0;
+            } else if (IS_HIGH_SURROGATE(buffer[0]) && length >= 2 && IS_LOW_SURROGATE(buffer[1])) {
+                ch = 0x10000 + (((Uint32)buffer[0] - 0xd800) << 10) + ((Uint32)buffer[1] - 0xdc00);
+                consumed = 2;
+            } else if (IS_HIGH_SURROGATE(buffer[0]) || IS_LOW_SURROGATE(buffer[0])) {
+                ch = 0xfffd;
+                consumed = 1;
             } else {
-                // The default keymap doesn't have any SDL_KMOD_MODE entries, so we don't need to override them
-                if (!(mods[m] & SDL_KMOD_MODE)) {
-                    SDL_SetKeymapEntry(keymap, scancode, mods[m], SDLK_UNKNOWN);
-                }
+                ch = buffer[0];
+                consumed = 1;
             }
+
+            /* Windows keyboard layouts can emit several UTF-32 code points on a single key press.
+             * Use <U+FFFD REPLACEMENT CHARACTER> since we cannot fit into single SDL_Keycode value in SDL keymap.
+             * See https://kbdlayout.info/features/ligatures for a list of such keys. */
+            SDL_SetKeymapEntry(keymap, scancode, mods[m], (consumed == length) ? ch : 0xfffd);
 
             if (result < 0) {
                 WIN_ResetDeadKeys();
