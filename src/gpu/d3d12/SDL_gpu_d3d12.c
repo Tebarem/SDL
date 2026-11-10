@@ -8514,7 +8514,59 @@ static void D3D12_INTERNAL_InitBlitResources(
     }
 }
 
-static bool D3D12_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+/* Creating a D3D12 device can take hundreds of milliseconds, and PrepareDriver
+ * has to create one to check feature support. D3D12 devices are singletons
+ * per adapter, so if we keep that device alive until CreateDevice runs, the
+ * second creation just returns the existing device instead of paying the
+ * full cost again.
+ */
+typedef struct D3D12ProbeDevice
+{
+    SDL_SharedObject *d3d12Dll;
+    ID3D12Device *device;
+} D3D12ProbeDevice;
+
+static void *s_ProbeDevice;
+
+static void D3D12_INTERNAL_DestroyProbeDevice(D3D12ProbeDevice *probe)
+{
+    if (probe) {
+        ID3D12Device_Release(probe->device);
+        SDL_UnloadObject(probe->d3d12Dll);
+        SDL_free(probe);
+    }
+}
+
+// Takes its own references to the device and to the D3D12 library
+static void D3D12_INTERNAL_KeepProbeDevice(ID3D12Device *device)
+{
+    D3D12ProbeDevice *probe = (D3D12ProbeDevice *)SDL_calloc(1, sizeof(*probe));
+    if (!probe) {
+        return;
+    }
+
+    probe->d3d12Dll = SDL_LoadObject(D3D12_DLL);
+    if (!probe->d3d12Dll) {
+        SDL_free(probe);
+        return;
+    }
+
+    ID3D12Device_AddRef(device);
+    probe->device = device;
+
+    D3D12_INTERNAL_DestroyProbeDevice((D3D12ProbeDevice *)SDL_SetAtomicPointer(&s_ProbeDevice, probe));
+}
+#endif
+
+static void D3D12_ReleasePreparedDriver(void)
+{
+#if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES))
+    D3D12_INTERNAL_DestroyProbeDevice((D3D12ProbeDevice *)SDL_SetAtomicPointer(&s_ProbeDevice, NULL));
+#endif
+}
+
+static bool D3D12_INTERNAL_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
 {
 #if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
     return true;
@@ -8681,6 +8733,9 @@ static bool D3D12_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
             }
         }
 
+        // Keep the device around so CreateDevice doesn't have to create it from scratch
+        D3D12_INTERNAL_KeepProbeDevice(device);
+
         ID3D12Device_Release(device);
     }
 
@@ -8726,6 +8781,15 @@ static bool D3D12_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
 
     return true;
 #endif
+}
+
+static bool D3D12_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
+{
+    if (!D3D12_INTERNAL_PrepareDriver(_this, props)) {
+        D3D12_ReleasePreparedDriver();
+        return false;
+    }
+    return true;
 }
 
 #if !(defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)) && defined(HAVE_IDXGIINFOQUEUE)
@@ -9681,6 +9745,13 @@ static SDL_GPUDevice *D3D12_CreateDevice(bool debugMode, bool preferLowPower, SD
             SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "Failed to load vendored D3D12 SDK Configuration");
         }
     }
+
+    /* The device PrepareDriver left alive can't be shared with a vendored
+     * D3D12 SDK, and it has to be gone before the debug layer is enabled.
+     */
+    if (debugMode || factory) {
+        D3D12_ReleasePreparedDriver();
+    }
 #endif
 
     // Initialize the D3D12 debug layer, if applicable
@@ -10082,7 +10153,8 @@ static SDL_GPUDevice *D3D12_CreateDevice(bool debugMode, bool preferLowPower, SD
 SDL_GPUBootstrap D3D12Driver = {
     "direct3d12",
     D3D12_PrepareDriver,
-    D3D12_CreateDevice
+    D3D12_CreateDevice,
+    D3D12_ReleasePreparedDriver
 };
 
 #endif // SDL_GPU_D3D12

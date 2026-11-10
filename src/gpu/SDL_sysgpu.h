@@ -1224,6 +1224,8 @@ typedef struct SDL_GPUBootstrap
     const char *name;
     bool (*PrepareDriver)(SDL_VideoDevice *_this, SDL_PropertiesID props);
     SDL_GPUDevice *(*CreateDevice)(bool debug_mode, bool prefer_low_power, SDL_PropertiesID props);
+    // Optional: release anything a successful PrepareDriver kept around for CreateDevice
+    void (*ReleasePreparedDriver)(void);
 } SDL_GPUBootstrap;
 
 #ifdef __cplusplus

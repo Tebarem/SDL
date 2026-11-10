@@ -697,7 +697,14 @@ bool SDL_GPUSupportsShaderFormats(
 bool SDL_GPUSupportsProperties(SDL_PropertiesID props)
 {
 #ifndef SDL_GPU_DISABLED
-    return (SDL_GPUSelectBackend(props) != NULL);
+    const SDL_GPUBootstrap *selectedBackend = SDL_GPUSelectBackend(props);
+    if (selectedBackend == NULL) {
+        return false;
+    }
+    if (selectedBackend->ReleasePreparedDriver) {
+        selectedBackend->ReleasePreparedDriver();
+    }
+    return true;
 #else
     SDL_SetError("SDL not built with GPU support");
     return false;
@@ -737,6 +744,9 @@ SDL_GPUDevice *SDL_CreateGPUDeviceWithProperties(SDL_PropertiesID props)
         preferLowPower = SDL_GetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN, false);
 
         result = selectedBackend->CreateDevice(debug_mode, preferLowPower, props);
+        if (selectedBackend->ReleasePreparedDriver) {
+            selectedBackend->ReleasePreparedDriver();
+        }
         if (result != NULL) {
             result->backend = selectedBackend->name;
             result->debug_mode = debug_mode;
